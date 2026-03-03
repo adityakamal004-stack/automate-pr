@@ -1,0 +1,62 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get PR Diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff origin/${{ github.base_ref }} > pr.diff
+
+      - name: Send Diff to Groq
+        run: |
+          DIFF_CONTENT=$(cat pr.diff | head -n 1000 | sed 's/"/\\"/g')
+
+          RESPONSE=$(curl https://api.groq.com/openai/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $GROQ_API_KEY" \
+            -d "{
+              \"model\": \"llama3-70b-8192\",
+              \"messages\": [
+                {
+                  \"role\": \"system\",
+                  \"content\": \"You are a senior software engineer reviewing a pull request.\"
+                },
+                {
+                  \"role\": \"user\",
+                  \"content\": \"Review this PR diff and provide feedback with critical issues, warnings, and suggestions:\\n\\n$DIFF_CONTENT\"
+                }
+              ]
+            }")
+
+          echo "$RESPONSE" > review.json
+
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+
+      - name: Post Comment to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = JSON.parse(fs.readFileSync('review.json', 'utf8'));
+            const message = review.choices?.[0]?.message?.content || "No review generated.";
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "🤖 **AI Review (Groq):**\n\n" + message
+            });
