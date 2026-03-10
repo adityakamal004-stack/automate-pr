@@ -11,52 +11,207 @@ permissions:
 jobs:
   ai-review:
     runs-on: ubuntu-latest
+    environment: prod
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Get PR Diff
+      # Step 1: Parse the diff into structured JSON
+      - name: Parse PR Diff
         run: |
-          git fetch origin ${{ github.base_ref }}
-          git diff origin/${{ github.base_ref }} > pr.diff
+          git diff origin/${{ github.base_ref }}...HEAD > pr.diff
 
-      - name: Send Diff to Groq
+          python3 << 'PYEOF'
+          import json, re, sys
+
+          diff_text = open("pr.diff", "r", errors="replace").read()
+          files = []
+          current_file = None
+          current_lines = []
+          new_line_num = 0
+          total_lines = 0
+          MAX_LINES = 800
+
+          for line in diff_text.splitlines():
+              if total_lines >= MAX_LINES:
+                  break
+
+              # New file header
+              m = re.match(r'^diff --git a/.+ b/(.+)$', line)
+              if m:
+                  if current_file and current_lines:
+                      files.append({"path": current_file, "changes": current_lines})
+                  current_file = m.group(1)
+                  current_lines = []
+                  continue
+
+              # Hunk header — extract the new-file starting line number
+              m = re.match(r'^@@ .+\+(\d+)', line)
+              if m:
+                  new_line_num = int(m.group(1))
+                  continue
+
+              # Track new-file line numbers
+              if line.startswith('+') and not line.startswith('+++'):
+                  current_lines.append({
+                      "line": new_line_num,
+                      "type": "add",
+                      "content": line[1:]
+                  })
+                  new_line_num += 1
+                  total_lines += 1
+              elif line.startswith('-') and not line.startswith('---'):
+                  # Deleted lines don't advance the new-file line counter
+                  pass
+              else:
+                  # Context line — advances the new-file counter
+                  new_line_num += 1
+
+          # Don't forget the last file
+          if current_file and current_lines:
+              files.append({"path": current_file, "changes": current_lines})
+
+          with open("parsed_diff.json", "w") as f:
+              json.dump(files, f)
+
+          print(f"Parsed {len(files)} file(s), {total_lines} added line(s)")
+          PYEOF
+
+      # Step 2: Send structured diff to Groq for JSON review
+      - name: AI Review with Groq
         run: |
-          DIFF_CONTENT=$(cat pr.diff | head -n 1000 | sed 's/"/\\"/g')
+          DIFF_JSON=$(cat parsed_diff.json)
 
-          RESPONSE=$(curl https://api.groq.com/openai/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $GROQ_API_KEY" \
-            -d "{
-              \"model\": \"llama3-70b-8192\",
-              \"messages\": [
+          PAYLOAD=$(jq -n \
+            --arg diff "$DIFF_JSON" \
+            '{
+              model: "llama-3.3-70b-versatile",
+              temperature: 0.1,
+              response_format: { type: "json_object" },
+              messages: [
                 {
-                  \"role\": \"system\",
-                  \"content\": \"You are a senior software engineer reviewing a pull request.\"
+                  role: "system",
+                  content: "You are a senior software engineer reviewing a pull request. You MUST respond with valid JSON only.\n\nReturn this exact JSON structure:\n{\"summary\": \"Overall assessment of the PR\", \"comments\": [{\"path\": \"file.js\", \"line\": 42, \"body\": \"Your comment\"}]}\n\nRules:\n- \"path\" must exactly match a file path from the diff\n- \"line\" must exactly match a line number from the diff (only added lines)\n- Prefix each comment body with a severity emoji: 🔴 for critical issues, 🟡 for warnings, 🔵 for suggestions\n- Focus on bugs, security issues, performance problems, and code quality\n- If nothing to comment on, return {\"summary\": \"...\", \"comments\": []}"
                 },
                 {
-                  \"role\": \"user\",
-                  \"content\": \"Review this PR diff and provide feedback with critical issues, warnings, and suggestions:\\n\\n$DIFF_CONTENT\"
+                  role: "user",
+                  content: ("Review this PR diff (JSON with file paths and added lines):\n\n" + $diff)
                 }
               ]
-            }")
+            }')
 
-          echo "$RESPONSE" > review.json
+          HTTP_CODE=$(curl -s -o review.json -w "%{http_code}" \
+            https://api.groq.com/openai/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $GROQ_API_KEY" \
+            -d "$PAYLOAD")
+
+          echo "Groq API responded with HTTP $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::Groq API returned HTTP $HTTP_CODE"
+            cat review.json
+            exit 1
+          fi
 
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
 
-      - name: Post Comment to PR
+      # Step 3: Post inline review comments via GitHub API
+      - name: Post Inline Review
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const review = JSON.parse(fs.readFileSync('review.json', 'utf8'));
-            const message = review.choices?.[0]?.message?.content || "No review generated.";
 
-            await github.rest.issues.createComment({
-              issue_number: context.issue.number,
+            // Load the parsed diff for validation
+            const parsedDiff = JSON.parse(fs.readFileSync('parsed_diff.json', 'utf8'));
+
+            // Build a set of valid (path, line) pairs for fast lookup
+            const validLocations = new Set();
+            for (const file of parsedDiff) {
+              for (const change of file.changes) {
+                validLocations.add(`${file.path}:${change.line}`);
+              }
+            }
+            const validPaths = new Set(parsedDiff.map(f => f.path));
+
+            // Load the AI review response
+            const rawReview = JSON.parse(fs.readFileSync('review.json', 'utf8'));
+            const content = rawReview.choices?.[0]?.message?.content;
+
+            if (!content) {
+              // Fallback: no content at all
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: "🤖 **AI Review:** No review content was generated."
+              });
+              return;
+            }
+
+            let review;
+            try {
+              review = JSON.parse(content);
+            } catch (e) {
+              // Fallback: invalid JSON — post raw text as a comment
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `🤖 **AI Review (Groq):**\n\n${content}`
+              });
+              return;
+            }
+
+            // Get the latest commit SHA (required by createReview)
+            const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: "🤖 **AI Review (Groq):**\n\n" + message
+              pull_number: context.issue.number
             });
+            const commitSha = pr.data.head.sha;
+
+            // Validate each comment against the parsed diff
+            const validComments = [];
+            const invalidComments = [];
+
+            for (const c of (review.comments || [])) {
+              const key = `${c.path}:${c.line}`;
+              if (validLocations.has(key)) {
+                validComments.push({
+                  path: c.path,
+                  line: c.line,
+                  body: c.body
+                });
+              } else {
+                invalidComments.push(c);
+              }
+            }
+
+            // Build review body
+            let body = `🤖 **AI Review (Groq)**\n\n${review.summary || 'No summary provided.'}`;
+
+            if (invalidComments.length > 0) {
+              body += '\n\n---\n**Additional comments** (could not be placed inline):\n';
+              for (const c of invalidComments) {
+                const filePath = validPaths.has(c.path) ? `\`${c.path}\`` : `\`${c.path}\` (unknown file)`;
+                body += `\n- ${filePath} line ${c.line}: ${c.body}`;
+              }
+            }
+
+            // Post the review
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              commit_id: commitSha,
+              body: body,
+              event: 'COMMENT',
+              comments: validComments
+            });
+
+            console.log(`Posted review: ${validComments.length} inline, ${invalidComments.length} in summary`);
